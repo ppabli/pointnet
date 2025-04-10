@@ -4,11 +4,15 @@ import torch.nn.functional as F
 
 def square_distance(src, dst):
 	"""
-	Calcula la distancia euclidiana al cuadrado entre todos los puntos de src y dst.
+	Calculate Euclideant distance between each two points.
+	src: source points, [B, N, C]
+	dst: target points, [B, M, C]
+	return dist: per-point square distance, [B, N, M]
 	"""
 
 	B, N, _ = src.shape
 	_, M, _ = dst.shape
+
 	dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
 	dist += torch.sum(src ** 2, -1).view(B, N, 1)
 	dist += torch.sum(dst ** 2, -1).view(B, 1, M)
@@ -17,7 +21,11 @@ def square_distance(src, dst):
 
 def index_points(points, idx):
 	"""
-	Indexa puntos según índices dados.
+	Input:
+		points: input points data, [B, N, C]
+		idx: sample index data, [B, S, [K]]
+	Return:
+		new_points:, indexed points data, [B, S, [K], C]
 	"""
 
 	device = points.device
@@ -33,11 +41,16 @@ def index_points(points, idx):
 
 def farthest_point_sample(xyz, npoint):
 	"""
-	Muestreo de puntos más lejanos.
+	Input:
+		xyz: pointcloud data, [B, N, 3]
+		npoint: number of samples
+	Return:
+		centroids: sampled pointcloud index, [B, npoint]
 	"""
 
 	device = xyz.device
 	B, N, C = xyz.shape
+
 	centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
 	distance = torch.ones(B, N).to(device) * 1e10
 	farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
@@ -56,12 +69,19 @@ def farthest_point_sample(xyz, npoint):
 
 def query_ball_point(radius, nsample, xyz, new_xyz):
 	"""
-	Encuentra puntos dentro de una esfera de radio dado.
+	Input:
+		radius: local region radius
+		nsample: max sample number in local region
+		xyz: all points, [B, N, 3]
+		new_xyz: query points, [B, S, 3]
+	Return:
+		group_idx: grouped points index, [B, S, nsample]
 	"""
 
 	device = xyz.device
 	B, N, C = xyz.shape
 	_, S, _ = new_xyz.shape
+
 	group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
 	sqrdists = square_distance(new_xyz, xyz)
 	group_idx[sqrdists > radius ** 2] = N
@@ -72,7 +92,6 @@ def query_ball_point(radius, nsample, xyz, new_xyz):
 
 	return group_idx
 
-# Capa de Set Abstraction para PointNet++
 class SetAbstraction(nn.Module):
 
 	def __init__(self, npoint, radius, nsample, in_channel, mlp, group_all=False):
@@ -86,7 +105,13 @@ class SetAbstraction(nn.Module):
 		self.mlp_convs = nn.ModuleList()
 		self.mlp_bns = nn.ModuleList()
 
-		last_channel = in_channel + 3
+		first_layer = 3
+
+		if in_channel > 0:
+
+			first_layer += in_channel
+
+		last_channel = first_layer
 
 		for out_channel in mlp:
 
@@ -97,30 +122,29 @@ class SetAbstraction(nn.Module):
 	def forward(self, xyz, points):
 		"""
 		Input:
-			xyz: coordenadas de los puntos [B, N, 3]
-			points: características de los puntos [B, N, D]
+			xyz: input points position data, [B, N, 3]
+			points: input points data, [B, N, D] or None
 		Return:
-			new_xyz: coordenadas de los puntos muestreados [B, npoint, 3]
-			new_points: características agrupadas [B, npoint, mlp[-1]]
+			new_xyz: sampled points position data, [B, S, 3]
+			new_points: sample points feature data, [B, S, D']
 		"""
 
-		device = xyz.device
 		B, N, C = xyz.shape
 
 		if self.group_all:
 
-			new_xyz = torch.zeros(B, 1, C).to(device)
+			new_xyz = torch.zeros(B, 1, C).to(xyz.device)
 			grouped_xyz = xyz.view(B, 1, N, C)
+			grouped_xyz_norm = grouped_xyz
 
 		else:
 
 			fps_idx = farthest_point_sample(xyz, self.npoint)
 			new_xyz = index_points(xyz, fps_idx)
-
 			idx = query_ball_point(self.radius, self.nsample, xyz, new_xyz)
 			grouped_xyz = index_points(xyz, idx)
 
-			grouped_xyz -= new_xyz.view(B, self.npoint, 1, C)
+			grouped_xyz_norm = grouped_xyz - new_xyz.view(B, self.npoint, 1, C)
 
 		if points is not None:
 
@@ -132,11 +156,11 @@ class SetAbstraction(nn.Module):
 
 				grouped_points = index_points(points, idx)
 
-			grouped_points = torch.cat([grouped_xyz, grouped_points], dim=-1)
+			grouped_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
 
 		else:
 
-			grouped_points = grouped_xyz
+			grouped_points = grouped_xyz_norm
 
 		grouped_points = grouped_points.permute(0, 3, 2, 1)
 
@@ -145,7 +169,7 @@ class SetAbstraction(nn.Module):
 			grouped_points = F.relu(self.mlp_bns[i](conv(grouped_points)))
 
 		new_points = torch.max(grouped_points, 2)[0]
-		new_points = new_points.permute(0, 2, 1)
+		new_points = new_points.transpose(1, 2)
 
 		return new_xyz, new_points
 
@@ -154,47 +178,67 @@ class PointNetPlusPlus(nn.Module):
 	def __init__(self, num_classes=3, normal_channel=False):
 
 		super(PointNetPlusPlus, self).__init__()
-		self.normal_channel = normal_channel
-		in_channel = 6 if normal_channel else 3
 
-		self.sa1 = SetAbstraction(npoint=512, radius=0.2, nsample=32, in_channel=in_channel, mlp=[64, 64, 128], group_all=False)
-		self.sa2 = SetAbstraction(npoint=128, radius=0.4, nsample=64, in_channel=128, mlp=[128, 128, 256], group_all=False)
-		self.sa3 = SetAbstraction(npoint=None, radius=None, nsample=None, in_channel=256, mlp=[256, 512, 1024], group_all=True)
+		self.normal_channel = normal_channel
+
+		self.sa1 = SetAbstraction(
+			npoint=512,
+			radius=0.2,
+			nsample=32,
+			in_channel=0 if not normal_channel else 3,
+			mlp=[64, 64, 128],
+			group_all=False
+		)
+
+		self.sa2 = SetAbstraction(
+			npoint=128,
+			radius=0.4,
+			nsample=64,
+			in_channel=128,
+			mlp=[128, 128, 256],
+			group_all=False
+		)
+
+		self.sa3 = SetAbstraction(
+			npoint=None,
+			radius=None,
+			nsample=None,
+			in_channel=256,
+			mlp=[256, 512, 1024],
+			group_all=True
+		)
 
 		self.fc1 = nn.Linear(1024, 512)
 		self.bn1 = nn.BatchNorm1d(512)
 		self.drop1 = nn.Dropout(0.4)
+
 		self.fc2 = nn.Linear(512, 256)
 		self.bn2 = nn.BatchNorm1d(256)
 		self.drop2 = nn.Dropout(0.4)
+
 		self.fc3 = nn.Linear(256, num_classes)
 
 	def forward(self, xyz):
 
-		B, _, _ = xyz.shape
+		B, C, N = xyz.shape
+		xyz = xyz.transpose(2, 1).contiguous()
 
 		if self.normal_channel:
 
-			norm = xyz[:, 3:, :]
-			xyz = xyz[:, :3, :]
+			norm = xyz[:, :, 3:]
+			xyz = xyz[:, :, :3]
 
 		else:
 
 			norm = None
 
-		# Capa 1 de Set Abstraction
 		l1_xyz, l1_points = self.sa1(xyz, norm)
 
-		# Capa 2 de Set Abstraction
 		l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
 
-		# Capa 3 de Set Abstraction (agrupamiento global)
 		_, l3_points = self.sa3(l2_xyz, l2_points)
 
-		# Flatten
 		x = l3_points.view(B, 1024)
-
-		# Capas fully-connected
 		x = self.drop1(F.relu(self.bn1(self.fc1(x))))
 		x = self.drop2(F.relu(self.bn2(self.fc2(x))))
 		x = self.fc3(x)

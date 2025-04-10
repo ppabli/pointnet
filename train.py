@@ -8,26 +8,58 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 import open3d as o3d
 import time
-from sklearn.metrics import confusion_matrix
+import csv
+import gc
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, classification_report, accuracy_score
+import matplotlib.pyplot as plt
+import tracemalloc
 
 from pointnet import PointNet, feature_transform_regularizer
 from pointnet_pp import PointNetPlusPlus
 from kitti_dataset import get_kitti_object_dataloaders
 
+def save_metrics_csv(metrics_dict, filepath):
+	"""Save metrics to a CSV file
+
+	Args:
+		metrics_dict: Dictionary containing metrics data
+		filepath: Path to save the CSV file
+	"""
+	os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+	with open(filepath, 'w', newline='') as csvfile:
+
+		fieldnames = list(metrics_dict.keys())
+		writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+		writer.writeheader()
+		max_len = max([len(metrics_dict[k]) if isinstance(metrics_dict[k], list) else 1 for k in fieldnames])
+
+		for key in fieldnames:
+
+			if not isinstance(metrics_dict[key], list):
+
+				metrics_dict[key] = [metrics_dict[key]] * max_len
+
+		for i in range(max_len):
+
+			row = {key: metrics_dict[key][i] if i < len(metrics_dict[key]) else None for key in fieldnames}
+			writer.writerow(row)
+
+	print(f"Metrics saved to {filepath}")
+
 def train(args):
+	"""Train the PointNet/PointNet++ model on the KITTI dataset"""
 
-	# Configuracion de dispositivo
 	device = torch.device("cuda" if torch.cuda.is_available() and args.use_cuda else "cpu")
-	print(f"Usando dispositivo: {device}")
+	print(f"Using device: {device}")
 
-	# Dataloader con WeightedRandomSampler para manejar el desbalance durante el muestreo
-	train_loader, val_loader, test_loader = get_kitti_object_dataloaders(
+	train_loader, val_loader, _ = get_kitti_object_dataloaders(
 		root_dir=args.data_path,
 		batch_size=args.batch_size,
 		num_points=args.num_points
 	)
 
-	# Modelo
 	if args.model == 'pointnet':
 
 		model = PointNet(num_classes=args.num_classes, feature_transform=args.feature_transform)
@@ -38,22 +70,17 @@ def train(args):
 
 	else:
 
-		raise ValueError(f"Modelo {args.model} no soportado")
+		raise ValueError(f"Model {args.model} not supported")
 
 	model = model.to(device)
 
-	# Optimizador y planificador
 	optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 	scheduler = StepLR(optimizer, step_size=20, gamma=0.5)
 
-	# Tambien usamos pesos en la funcion de perdida para balance adicional
-	# Este enfoque dual (WeightedRandomSampler + weighted loss) puede ser muy efectivo
 	class_counts = [0] * args.num_classes
-	print("Calculando pesos para la funcion de perdida...")
 
-	# En vez de contar en el dataloader (ya balanceado por el sampler),
-	# obtenemos los conteos de clases originales
-	# Esto se puede extraer de train_dataset.data si lo exponemos
+	print("Calculating weights for loss function...")
+
 	for _, target in train_loader:
 
 		valid_indices = target != -1
@@ -66,50 +93,65 @@ def train(args):
 
 				class_counts[t.item()] += 1
 
-	print(f"Conteo de clases: {class_counts}")
+	print(f"Class counts: {class_counts}")
 
-	# Cálculo de pesos inversos a la frecuencia
-	weights = torch.FloatTensor([1.0/max(count, 1) for count in class_counts])
+	weights = torch.FloatTensor([1.0 / max(count, 1) for count in class_counts])
 	weights = weights / weights.sum() * args.num_classes
 	weights = weights.to(device)
 
-	print(f"Pesos para las clases en la funcion de perdida: {weights}")
+	print(f"Weights for loss function: {weights}")
 
-	# Funcion de perdida con pesos
 	criterion = nn.CrossEntropyLoss(weight=weights)
 
-	# Metricas de seguimiento
 	best_acc = 0.0
 	train_loss_history = []
 	train_acc_history = []
 	val_loss_history = []
 	val_acc_history = []
+	train_f1_history = []
+	val_f1_history = []
 
-	train_start = time.time()
+	train_metrics = {
+		'epoch': [],
+		'loss': [],
+		'accuracy': [],
+		'precision_macro': [],
+		'recall_macro': [],
+		'f1_macro': [],
+		'precision_weighted': [],
+		'recall_weighted': [],
+		'f1_weighted': [],
+	}
 
-	# Entrenamiento
+	val_metrics = {
+		'epoch': [],
+		'loss': [],
+		'accuracy': [],
+		'precision_macro': [],
+		'recall_macro': [],
+		'f1_macro': [],
+		'precision_weighted': [],
+		'recall_weighted': [],
+		'f1_weighted': [],
+	}
+
 	for epoch in range(args.epochs):
 
-		# Entrenamiento
 		model.train()
 		train_loss = 0.0
-		train_correct = 0
-		train_total = 0
+		all_train_preds = []
+		all_train_targets = []
 
-		pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"epoca {epoch+1}/{args.epochs}")
+		pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"epoch {epoch+1}/{args.epochs}")
 
 		for i, (points, target) in pbar:
 
-			# Filtramos batches vacíos si aún quedan elementos con etiqueta -1
 			valid_indices = target != -1
 
 			if not valid_indices.any():
 
 				continue
 
-			# Si estamos usando el WeightedRandomSampler correctamente,
-			# los batches ya deberían estar balanceados en terminos de clases
-			# y contener menos elementos con etiqueta -1
 			points = points[valid_indices]
 			target = target[valid_indices]
 
@@ -118,7 +160,6 @@ def train(args):
 
 			optimizer.zero_grad()
 
-			# Forward pass
 			if args.model == 'pointnet':
 
 				pred, trans_feat = model(points)
@@ -128,56 +169,81 @@ def train(args):
 				pred = model(points)
 				trans_feat = None
 
-			# Cálculo de perdida
 			loss = criterion(pred, target)
 
 			if args.feature_transform and args.model == 'pointnet':
+
 				loss += args.feature_transform_regularizer * feature_transform_regularizer(trans_feat)
 
-			# Backward pass
 			loss.backward()
 			optimizer.step()
 
-			# Estadísticas
 			train_loss += loss.item()
 			_, predicted = torch.max(pred.data, 1)
-			train_total += target.size(0)
-			train_correct += (predicted == target).sum().item()
 
-			# Actualizar barra de progreso
-			pbar.set_postfix({
-				'loss': f"{train_loss/(i+1):.4f}",
-				'acc': f"{100.0*train_correct/train_total:.2f}%"
-			})
+			all_train_preds.extend(predicted.cpu().numpy())
+			all_train_targets.extend(target.cpu().numpy())
 
-		# Calculamos metricas del epoch
-		if train_total > 0:
+			if len(all_train_targets) > 0:
+
+				current_acc = accuracy_score(all_train_targets, all_train_preds)
+
+				pbar.set_postfix({
+					'loss': f"{train_loss/(i+1):.4f}",
+					'acc': f"{current_acc:.4f}%"
+				})
+
+			gc.collect()
+			if torch.cuda.is_available():
+
+				torch.cuda.empty_cache()
+
+		if len(all_train_targets) > 0:
 
 			train_loss = train_loss / len(train_loader)
-			train_acc = 100.0 * train_correct / train_total
+			train_acc = accuracy_score(all_train_targets, all_train_preds)
 			train_loss_history.append(train_loss)
 			train_acc_history.append(train_acc)
 
+			train_f1 = f1_score(all_train_targets, all_train_preds, average='macro')
+			train_f1_history.append(train_f1)
+
+			train_precision_macro = precision_score(all_train_targets, all_train_preds, average='macro', zero_division=0)
+			train_recall_macro = recall_score(all_train_targets, all_train_preds, average='macro', zero_division=0)
+			train_precision_weighted = precision_score(all_train_targets, all_train_preds, average='weighted', zero_division=0)
+			train_recall_weighted = recall_score(all_train_targets, all_train_preds, average='weighted', zero_division=0)
+			train_f1_weighted = f1_score(all_train_targets, all_train_preds, average='weighted', zero_division=0)
+
+			train_metrics['epoch'].append(epoch + 1)
+			train_metrics['loss'].append(train_loss)
+			train_metrics['accuracy'].append(train_acc)
+			train_metrics['precision_macro'].append(train_precision_macro)
+			train_metrics['recall_macro'].append(train_recall_macro)
+			train_metrics['f1_macro'].append(train_f1)
+			train_metrics['precision_weighted'].append(train_precision_weighted)
+			train_metrics['recall_weighted'].append(train_recall_weighted)
+			train_metrics['f1_weighted'].append(train_f1_weighted)
+
 		else:
 
-			print("Warning: No valid training samples in this epoch")
+			print("Warning: No valid labels in batch")
+
 			train_loss_history.append(0)
 			train_acc_history.append(0)
+			train_f1 = 0
+			train_f1_history.append(0)
 
-		# Actualizar learning rate
 		scheduler.step()
 
-		# Evaluacion
 		model.eval()
 		val_loss = 0.0
-		val_correct = 0
-		val_total = 0
+		all_val_preds = []
+		all_val_targets = []
 
 		with torch.no_grad():
 
 			for points, target in val_loader:
 
-				valid_indices = target != -1
 				if not valid_indices.any():
 
 					continue
@@ -188,7 +254,6 @@ def train(args):
 				points, target = points.to(device), target.to(device)
 				points = points.transpose(2, 1)  # [B, N, C] -> [B, C, N]
 
-				# Forward pass
 				if args.model == 'pointnet':
 
 					pred, trans_feat = model(points)
@@ -197,44 +262,65 @@ def train(args):
 
 					pred = model(points)
 
-				# Cálculo de perdida
 				loss = criterion(pred, target)
 				val_loss += loss.item()
 
-				# Estadísticas
 				_, predicted = torch.max(pred.data, 1)
-				val_total += target.size(0)
-				val_correct += (predicted == target).sum().item()
 
-		# Metricas de evaluacion
-		if val_total > 0:
+				all_val_preds.extend(predicted.cpu().numpy())
+				all_val_targets.extend(target.cpu().numpy())
+
+				gc.collect()
+				if torch.cuda.is_available():
+
+					torch.cuda.empty_cache()
+
+		if len(all_val_targets) > 0:
 
 			val_loss = val_loss / len(val_loader)
-			val_acc = 100.0 * val_correct / val_total
+			val_acc = accuracy_score(all_val_targets, all_val_preds)
+			val_f1 = f1_score(all_val_targets, all_val_preds, average='macro')
+
 			val_loss_history.append(val_loss)
 			val_acc_history.append(val_acc)
+			val_f1_history.append(val_f1)
 
-			print(f"epoca {epoch+1}/{args.epochs}")
-			print(f"Entrenamiento: Perdida={train_loss:.4f}, Precision={train_acc:.2f}%")
-			print(f"Evaluacion: Perdida={val_loss:.4f}, Precision={val_acc:.2f}%")
+			val_precision_macro = precision_score(all_val_targets, all_val_preds, average='macro', zero_division=0)
+			val_recall_macro = recall_score(all_val_targets, all_val_preds, average='macro', zero_division=0)
+			val_precision_weighted = precision_score(all_val_targets, all_val_preds, average='weighted', zero_division=0)
+			val_recall_weighted = recall_score(all_val_targets, all_val_preds, average='weighted', zero_division=0)
+			val_f1_weighted = f1_score(all_val_targets, all_val_preds, average='weighted', zero_division=0)
 
-			# Guardar mejor modelo
-			if val_acc > best_acc:
+			val_metrics['epoch'].append(epoch + 1)
+			val_metrics['loss'].append(val_loss)
+			val_metrics['accuracy'].append(val_acc)
+			val_metrics['precision_macro'].append(val_precision_macro)
+			val_metrics['recall_macro'].append(val_recall_macro)
+			val_metrics['f1_macro'].append(val_f1)
+			val_metrics['precision_weighted'].append(val_precision_weighted)
+			val_metrics['recall_weighted'].append(val_recall_weighted)
+			val_metrics['f1_weighted'].append(val_f1_weighted)
 
-				best_acc = val_acc
+			print(f"Training: Loss={train_loss:.4f}, Accuracy={train_acc:.4f}%, F1={train_f1:.4f}")
+			print(f"Validation: Loss={val_loss:.4f}, Accuracy={val_acc:.4f}%, F1={val_f1:.4f}")
+
+			if val_f1 > best_acc:
+
+				best_acc = val_f1
 
 				checkpoint = {
 					'epoch': epoch + 1,
 					'model_state_dict': model.state_dict(),
 					'optimizer_state_dict': optimizer.state_dict(),
-					'best_acc': best_acc
+					'best_acc': val_acc,
+					'best_f1': best_acc
 				}
 
 				model_dir = os.path.join(args.output_dir, f"{args.model}_best.pth")
 				torch.save(checkpoint, model_dir)
-				print(f"Nuevo mejor modelo guardado con precision: {best_acc:.2f}% | Modelo guardado en: {model_dir}")
 
-		# Guardar checkpoint
+				print(f"New best model saved with F1-score: {best_acc:.4f} | Model saved at: {model_dir}")
+
 		if (epoch + 1) % args.checkpoint_interval == 0:
 
 			checkpoint = {
@@ -246,16 +332,20 @@ def train(args):
 
 			torch.save(checkpoint, os.path.join(args.output_dir, f"{args.model}_epoch_{epoch+1}.pth"))
 
-	train_end = time.time()
+	train_csv_path = os.path.join(args.output_dir, f"{args.model}_train_metrics.csv")
+	val_csv_path = os.path.join(args.output_dir, f"{args.model}_val_metrics.csv")
 
-	print(f"Entrenamiento completado | Tiempo consumido: {train_end - train_start:.2f} segundos | Mejor precision: {best_acc:.2f}%")
+	save_metrics_csv(train_metrics, train_csv_path)
+	save_metrics_csv(val_metrics, val_csv_path)
+
+	print(f"Training completed | Best F1-score: {best_acc:.4f}")
 
 def inference(args):
 
-	# Configuracion de dispositivo
+	"""Perform inference on the KITTI dataset using a trained model"""
+
 	device = torch.device("cuda" if torch.cuda.is_available() and args.use_cuda else "cpu")
 
-	# Cargar modelo
 	if args.model == 'pointnet':
 
 		model = PointNet(num_classes=args.num_classes, feature_transform=args.feature_transform)
@@ -266,38 +356,34 @@ def inference(args):
 
 	else:
 
-		raise ValueError(f"Modelo {args.model} no soportado")
+		raise ValueError(f"Model {args.model} not supported")
 
 	checkpoint = torch.load(args.model_path, map_location=device)
 	model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 	model = model.to(device)
 	model.eval()
 
-	print(f"Modelo cargado desde {args.model_path}")
-	print(f"Precision del modelo: {checkpoint['best_acc']:.2f}%")
+	print(f"Model loaded from {args.model_path}")
+	print(f"Model accuracy: {checkpoint['best_acc']:.4f}%")
 
-	# Dataloader para inferencia
 	_, _, test_loader = get_kitti_object_dataloaders(
 		root_dir=args.data_path,
 		batch_size=args.batch_size,
 		num_points=args.num_points
 	)
 
-	# Clases
 	classes = ['Car', 'Pedestrian', 'Cyclist']
 
-	# Metricas
-	confusion_matrix = np.zeros((args.num_classes, args.num_classes), dtype=int)
-	class_correct = [0] * args.num_classes
-	class_total = [0] * args.num_classes
+	all_preds = []
+	all_targets = []
 
-	inference_start = time.time()
+	memory_usages = []
+	inference_times = []
 
 	with torch.no_grad():
 
-		for points, target in tqdm(test_loader, desc="Inferencia"):
+		for points, target in tqdm(test_loader, desc="Inference"):
 
-			# Ignoramos las muestras sin etiqueta (-1)
 			valid_indices = target != -1
 
 			if not valid_indices.any():
@@ -310,7 +396,9 @@ def inference(args):
 			points, target = points.to(device), target.to(device)
 			points = points.transpose(2, 1)  # [B, N, C] -> [B, C, N]
 
-			# Forward pass
+			inference_start = time.time()
+			tracemalloc.start()
+
 			if args.model == 'pointnet':
 
 				pred, _ = model(points)
@@ -319,105 +407,98 @@ def inference(args):
 
 				pred = model(points)
 
-			# Predicciones
+			_, peak_memory = tracemalloc.get_traced_memory()
+			inference_end = time.time()
+			tracemalloc.stop()
+
+			inference_time = inference_end - inference_start
+			memory_usage = peak_memory / 10 ** 6
+
+			inference_times.append(inference_time)
+			memory_usages.append(memory_usage)
+
 			_, predicted = torch.max(pred.data, 1)
 
-			# Estadísticas por clase
-			for i in range(target.size(0)):
+			all_preds.extend(predicted.cpu().numpy())
+			all_targets.extend(target.cpu().numpy())
 
-				label = target[i].item()
-				pred_label = predicted[i].item()
+			gc.collect()
+			if torch.cuda.is_available():
 
-				confusion_matrix[label][pred_label] += 1
-				class_total[label] += 1
+				torch.cuda.empty_cache()
 
-				if label == pred_label:
+	all_preds = np.array(all_preds)
+	all_targets = np.array(all_targets)
 
-					class_correct[label] += 1
+	accuracy = accuracy_score(all_targets, all_preds)
+	print(f"\nGlobal accuracy: {accuracy:.4f}%")
 
-	# Precision por clase
-	print("\nPrecision por clase:")
+	cm = confusion_matrix(all_targets, all_preds)
+
+	print("\nDetailed metrics by class:")
+	print(classification_report(all_targets, all_preds, target_names=classes, digits=4, zero_division=0))
+
+	precision = precision_score(all_targets, all_preds, average=None, zero_division=0)
+	recall = recall_score(all_targets, all_preds, average=None, zero_division=0)
+	f1 = f1_score(all_targets, all_preds, average=None, zero_division=0)
+
+	print("\nMetrics by class:")
 	for i in range(args.num_classes):
-
-		accuracy = 100.0 * class_correct[i] / class_total[i] if class_total[i] > 0 else 0
-		print(f"{classes[i]}: {accuracy:.2f}% ({class_correct[i]}/{class_total[i]})")
-
-	# Matriz de confusion
-	print("\nMatriz de confusion:")
-	print("Verdadero\\Predicho", end="\t")
-	for cls in classes:
-		print(f"{cls}", end="\t")
-	print()
-
-	# Imprimir matriz de confusion
-
-
-	for i in range(args.num_classes):
-
-		print(f"{classes[i]}", end="\t\t")
-
-		for j in range(args.num_classes):
-
-			print(f"{confusion_matrix[i][j]}", end="\t")
-
-		print()
-
-	# Calcular precision, recall y F1-score por clase
-	precision = np.zeros(args.num_classes)
-	recall = np.zeros(args.num_classes)
-	f1_score = np.zeros(args.num_classes)
-
-	for i in range(args.num_classes):
-
-		# Precision: TP / (TP + FP)
-		# True positives: diagonal de la matriz de confusion
-		true_positives = confusion_matrix[i][i]
-
-		# False positives: suma de la columna i menos el valor en la diagonal
-		false_positives = np.sum(confusion_matrix[:, i]) - true_positives
-
-		# Precision
-		precision[i] = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-
-		# Recall: TP / (TP + FN)
-		false_negatives = np.sum(confusion_matrix[i, :]) - true_positives
-
-		# Recall
-		recall[i] = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-
-		# F1 Score: 2 * (precision * recall) / (precision + recall)
-		f1_score[i] = 2 * (precision[i] * recall[i]) / (precision[i] + recall[i]) if (precision[i] + recall[i]) > 0 else 0
-
-	# Imprimir resultados
-	print("\nMetricas por clase:")
-
-	for i in range(args.num_classes):
-
 		print(f"{classes[i]}:")
 		print(f"Precision: {precision[i]:.4f}")
 		print(f"Recall: {recall[i]:.4f}")
-		print(f"F1-Score: {f1_score[i]:.4f}")
+		print(f"F1-Score: {f1[i]:.4f}")
 
-	macro_precision = np.mean(precision)
-	macro_recall = np.mean(recall)
-	macro_f1 = np.mean(f1_score)
+	macro_precision = precision_score(all_targets, all_preds, average='macro', zero_division=0)
+	macro_recall = recall_score(all_targets, all_preds, average='macro', zero_division=0)
+	macro_f1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
 
-	print("\nMetricas generales (macro):")
+	print("\nGeneral metrics (macro):")
 	print(f"Precision: {macro_precision:.4f}")
 	print(f"Recall: {macro_recall:.4f}")
 	print(f"F1-Score: {macro_f1:.4f}")
+	print(f"Memory usage (MB): {np.mean(memory_usages):.4f} ± {np.std(memory_usages):.4f}")
+	print(f"Inference time (s): {np.mean(inference_times):.4f} ± {np.std(inference_times):.4f}")
 
-	inference_end = time.time()
+	weighted_precision = precision_score(all_targets, all_preds, average='weighted', zero_division=0)
+	weighted_recall = recall_score(all_targets, all_preds, average='weighted', zero_division=0)
+	weighted_f1 = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
 
-	print("Inferencia completada | Tiempo consumido: {:.2f} segundos".format(inference_end - inference_start))
+	print("\nGeneral metrics (weighted):")
+	print(f"Precision: {weighted_precision:.4f}")
+	print(f"Recall: {weighted_recall:.4f}")
+	print(f"F1-Score: {weighted_f1:.4f}")
+
+	test_metrics = {
+		'accuracy': [accuracy],
+		'precision_macro': [macro_precision],
+		'recall_macro': [macro_recall],
+		'f1_macro': [macro_f1],
+		'precision_weighted': [weighted_precision],
+		'recall_weighted': [weighted_recall],
+		'f1_weighted': [weighted_f1],
+		'memory_usage': np.mean(memory_usages),
+		'memory_usage_std': np.std(memory_usages),
+		'inference_time': np.mean(inference_times),
+		'inference_time_std': np.std(inference_times)
+	}
+
+	for i, cls in enumerate(classes):
+
+		test_metrics[f'{cls}_precision'] = [precision[i]]
+		test_metrics[f'{cls}_recall'] = [recall[i]]
+		test_metrics[f'{cls}_f1'] = [f1[i]]
+
+	test_csv_path = os.path.join(args.output_dir, f"{args.model}_test_metrics.csv")
+	save_metrics_csv(test_metrics, test_csv_path)
+
+	print(f"Inference completed | Results saved to {test_csv_path}")
 
 def visualize_sample(args):
-	"""Visualiza una muestra de nube de puntos con su prediccion"""
+	"""Visualize a point cloud sample with its prediction"""
 
-	# Configuracion
 	device = torch.device("cuda" if torch.cuda.is_available() and args.use_cuda else "cpu")
 
-	# Cargar modelo
 	if args.model == 'pointnet':
 
 		model = PointNet(num_classes=args.num_classes, feature_transform=args.feature_transform)
@@ -425,6 +506,10 @@ def visualize_sample(args):
 	elif args.model == 'pointnetpp':
 
 		model = PointNetPlusPlus(num_classes=args.num_classes)
+
+	else:
+
+		raise ValueError(f"Model {args.model} not supported")
 
 	checkpoint = torch.load(args.model_path, map_location=device)
 
@@ -434,25 +519,30 @@ def visualize_sample(args):
 
 	model.eval()
 
-	# Dataloader para una sola muestra
 	_, _, test_loader = get_kitti_object_dataloaders(
 		root_dir=args.data_path,
 		batch_size=1,
 		num_points=args.num_points
 	)
 
-	# Clases
 	classes = ['Car', 'Pedestrian', 'Cyclist']
 
-	# Obtener una muestra
-
+	found_valid_sample = False
 	for points, target in test_loader:
+
+		sample_start_time = time.time()
 
 		if target.item() != -1:
 
+			found_valid_sample = True
 			break
 
-	# Inferencia
+	if not found_valid_sample:
+
+		print("No valid samples found in the test set.")
+
+		return
+
 	with torch.no_grad():
 
 		points_cuda = points.to(device)
@@ -467,72 +557,83 @@ def visualize_sample(args):
 			pred = model(points_cuda)
 
 		_, predicted = torch.max(pred.data, 1)
+		probs = torch.nn.functional.softmax(pred, dim=1)
+		conf_score = probs[0][predicted.item()].item()
 
-	# Visualizacion
 	points_np = points.squeeze().numpy()
 
-	# Crear nube de puntos para Open3D
 	pcd = o3d.geometry.PointCloud()
 	pcd.points = o3d.utility.Vector3dVector(points_np)
 
-	# Colorear según la clase predicha
 	colors = np.zeros((points_np.shape[0], 3))
-	if predicted.item() == 0:  # Car - rojo
 
-		colors[:, 0] = 1.0
+	if predicted.item() == 0:
 
-	elif predicted.item() == 1:  # Pedestrian - verde
+		colors[:, 0] = 1.0  # Red for Car
 
-		colors[:, 1] = 1.0
+	elif predicted.item() == 1:
 
-	else:  # Cyclist - azul
+		colors[:, 1] = 1.0  # Green for Pedestrian
 
-		colors[:, 2] = 1.0
+	else:
+
+		colors[:, 2] = 1.0  # Blue for Cyclist
 
 	pcd.colors = o3d.utility.Vector3dVector(colors)
 
-	# Mostrar informacion
-	true_label = "Desconocido" if target.item() == -1 else classes[target.item()]
+	true_label = "Unknown" if target.item() == -1 else classes[target.item()]
 	pred_label = classes[predicted.item()]
-	print(f"Etiqueta verdadera: {true_label}")
-	print(f"Etiqueta predicha: {pred_label}")
 
-	# Visualizar
-	o3d.visualization.draw_geometries([pcd], window_name=f"KITTI - Prediccion: {pred_label}", width=800, height=600)
+	print(f"True label: {true_label}")
+	print(f"Predicted label: {pred_label} (confidence: {conf_score:.4f})")
+
+	print("\nProbabilities by class:")
+	for i, cls in enumerate(classes):
+
+		print(f"{cls}: {probs[0][i].item():.4f}")
+
+	viz_metrics = {
+		'confidence_score': [conf_score],
+		'true_label': [true_label],
+		'predicted_label': [pred_label]
+	}
+
+	for i, cls in enumerate(classes):
+		viz_metrics[f'{cls}_probability'] = [probs[0][i].item()]
+
+	viz_csv_path = os.path.join(args.output_dir, f"{args.model}_visualization_metrics.csv")
+	save_metrics_csv(viz_metrics, viz_csv_path)
+
+	o3d.visualization.draw_geometries([pcd], window_name=f"KITTI - Prediction: {pred_label} ({conf_score:.4f})", width=800, height=600)
 
 if __name__ == "__main__":
 
-	parser = argparse.ArgumentParser(description='PointNet/PointNet++ para clasificacion KITTI')
+	parser = argparse.ArgumentParser(description='PointNet/PointNet++ for KITTI classification')
 
-	# Argumentos generales
-	parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference', 'visualize'], help='Modo de ejecucion: entrenar o inferir')
-	parser.add_argument('--data_path', type=str, required=True, help='Ruta al dataset KITTI')
-	parser.add_argument('--output_dir', type=str, default='./output', help='Directorio de salida para modelos y resultados')
-	parser.add_argument('--model', type=str, default='pointnet', choices=['pointnet', 'pointnetpp'], help='Modelo a utilizar: pointnet o pointnetpp')
-	parser.add_argument('--num_classes', type=int, default=3, help='Número de clases (por defecto 3: Car, Pedestrian, Cyclist)')
-	parser.add_argument('--num_points', type=int, default=4096, help='Número de puntos por nube')
-	parser.add_argument('--use_cuda', action='store_true', help='Deshabilitar CUDA')
+	parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference', 'visualize'], help='Execution mode: train or infer')
+	parser.add_argument('--data_path', type=str, required=True, help='Path to KITTI dataset')
+	parser.add_argument('--output_dir', type=str, default='./output', help='Output directory for models and results')
+	parser.add_argument('--model', type=str, default='pointnet', choices=['pointnet', 'pointnetpp'], help='Model to use: pointnet or pointnetpp')
+	parser.add_argument('--num_classes', type=int, default=3, help='Number of classes (default 3: Car, Pedestrian, Cyclist)')
+	parser.add_argument('--num_points', type=int, default=4096, help='Number of points per cloud')
+	parser.add_argument('--use_cuda', action='store_true', help='Enable CUDA')
 
-	# Argumentos para entrenamiento
-	parser.add_argument('--batch_size', type=int, default=32, help='Tamaño de batch para entrenamiento')
-	parser.add_argument('--epochs', type=int, default=50, help='Número de epocas de entrenamiento')
-	parser.add_argument('--lr', type=float, default=0.001, help='Tasa de aprendizaje inicial')
-	parser.add_argument('--weight_decay', type=float, default=1e-4, help='Peso de decaimiento para regularizacion L2')
-	parser.add_argument('--feature_transform', action='store_true', help='Usar transformacion de características para PointNet')
-	parser.add_argument('--feature_transform_regularizer', type=float, default=0.001, help='Peso para regularizacion de matriz de transformacion')
-	parser.add_argument('--checkpoint_interval', type=int, default=10, help='Intervalo de epocas para guardar checkpoints')
+	parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+	parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+	parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate')
+	parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay for L2 regularization')
+	parser.add_argument('--feature_transform', action='store_true', help='Use feature transformation for PointNet')
+	parser.add_argument('--feature_transform_regularizer', type=float, default=0.001, help='Weight for transformation matrix regularization')
+	parser.add_argument('--checkpoint_interval', type=int, default=10, help='Epoch interval for saving checkpoints')
 
-	# Argumentos para inferencia y visualizacion
-	parser.add_argument('--model_path', type=str, help='Ruta al modelo entrenado para inferencia/visualizacion')
+	parser.add_argument('--model_path', type=str, help='Path to trained model for inference/visualization')
 
 	args = parser.parse_args()
 
-	# Crear directorio de salida si no existe
 	if not os.path.exists(args.output_dir):
 
 		os.makedirs(args.output_dir)
 
-	# Ejecutar el modo seleccionado
 	if args.mode == 'train':
 
 		train(args)
@@ -541,7 +642,7 @@ if __name__ == "__main__":
 
 		if args.model_path is None:
 
-			parser.error("--model_path es requerido para el modo 'inference'")
+			parser.error("--model_path is required for 'inference' mode")
 
 		inference(args)
 
@@ -549,10 +650,10 @@ if __name__ == "__main__":
 
 		if args.model_path is None:
 
-			parser.error("--model_path es requerido para el modo 'inference'")
+			parser.error("--model_path is required for 'visualize' mode")
 
 		visualize_sample(args)
 
 	else:
 
-		parser.error("Modo no soportado. Usa 'train' o 'inference'")
+		parser.error("Mode not supported. Use 'train', 'inference' or 'visualize'")

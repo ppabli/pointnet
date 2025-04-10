@@ -45,7 +45,6 @@ class TNet(nn.Module):
 
 		return x
 
-# Implementación de PointNet
 class PointNet(nn.Module):
 
 	def __init__(self, num_classes=3, feature_transform=True):

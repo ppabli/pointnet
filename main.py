@@ -1,42 +1,31 @@
 import os
 import argparse
 import torch
-
 from train import train, inference, visualize_sample
 
 def main():
 
-	parser = argparse.ArgumentParser(description='Sistema de clasificacion de nubes de puntos LiDAR usando KITTI')
+	parser = argparse.ArgumentParser(description='LiDAR Point Cloud Classification System using KITTI')
 
-	# Argumentos principales
-	parser.add_argument('--action', type=str, required=True, choices=['train', 'test'], help='Accion a realizar')
-
-	# Argumentos para rutas
-	parser.add_argument('--data_dir', type=str, default='./data/kitti', help='Directorio del dataset KITTI')
-	parser.add_argument('--output_dir', type=str, default='./output', help='Directorio para guardar resultados')
-
-	# Argumentos para modelo
-	parser.add_argument('--model', type=str, default='pointnet', choices=['pointnet', 'pointnetpp'], help='Modelo a utilizar')
-	parser.add_argument('--model_path', type=str, default=None, help='Ruta al modelo pre-entrenado')
-
-	# Argumentos para entrenamiento
-	parser.add_argument('--epochs', type=int, default=50, help='Numero de epocas')
-	parser.add_argument('--batch_size', type=int, default=32, help='Tamaño de batch')
-	parser.add_argument('--learning_rate', type=float, default=0.001, help='Tasa de aprendizaje')
-	parser.add_argument('--num_points', type=int, default=4096, help='Numero de puntos a utilizar por muestra')
-	parser.add_argument('--feature_transform', action='store_true', help='Usar transformacion de características para PointNet')
-
-	# Argumentos para visualizacion
-	parser.add_argument('--sample_idx', type=int, default=0, help='Índice de la muestra a visualizar')
+	parser.add_argument('--action', type=str, required=True, choices=['train', 'test', 'visualize'], help='Action to perform')
+	parser.add_argument('--data_dir', type=str, default='./data/kitti', help='KITTI dataset directory')
+	parser.add_argument('--output_dir', type=str, default='./output', help='Directory to save results')
+	parser.add_argument('--model', type=str, default='pointnet', choices=['pointnet', 'pointnetpp'], help='Model to use')
+	parser.add_argument('--model_path', type=str, default=None, help='Path to pre-trained model')
+	parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+	parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+	parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
+	parser.add_argument('--num_points', type=int, default=4096, help='Number of points to use per sample')
+	parser.add_argument('--feature_transform', action='store_true', help='Use feature transformation for PointNet')
+	parser.add_argument('--sample_idx', type=int, default=0, help='Index of the sample to visualize')
 
 	args = parser.parse_args()
 
-	# Aseguramos que el directorio de salida exista
 	os.makedirs(args.output_dir, exist_ok=True)
 
 	if args.action == 'train':
 
-		print(f"Entrenando modelo {args.model} con datos de {args.data_dir}")
+		print(f"Training {args.model} model with data from {args.data_dir}")
 
 		train_args = argparse.Namespace(
 			mode='train',
@@ -45,7 +34,7 @@ def main():
 			model=args.model,
 			num_classes=3,
 			num_points=args.num_points,
-			no_cuda=not torch.cuda.is_available(),
+			use_cuda=torch.cuda.is_available(),
 			batch_size=args.batch_size,
 			epochs=args.epochs,
 			lr=args.learning_rate,
@@ -61,10 +50,10 @@ def main():
 
 		if args.model_path is None:
 
-			print("Error: Se requiere --model_path para testing")
+			print("Error: --model_path is required for testing")
 			return
 
-		print(f"Evaluando modelo {args.model} desde {args.model_path}")
+		print(f"Evaluating {args.model} model from {args.model_path}")
 
 		test_args = argparse.Namespace(
 			mode='inference',
@@ -73,7 +62,7 @@ def main():
 			model=args.model,
 			num_classes=3,
 			num_points=args.num_points,
-			use_cuda=not torch.cuda.is_available(),
+			use_cuda=torch.cuda.is_available(),
 			batch_size=args.batch_size,
 			model_path=args.model_path,
 			feature_transform=args.feature_transform
@@ -85,10 +74,10 @@ def main():
 
 		if args.model_path is None:
 
-			print("Error: Se requiere --model_path para visualizacion")
+			print("Error: --model_path is required for visualization")
 			return
 
-		print(f"Visualizando resultados usando {args.model_path}")
+		print(f"Visualizing results using {args.model_path}")
 
 		vis_args = argparse.Namespace(
 			mode='visualize',
@@ -97,7 +86,7 @@ def main():
 			model=args.model,
 			num_classes=3,
 			num_points=args.num_points,
-			use_cuda=not torch.cuda.is_available(),
+			use_cuda=torch.cuda.is_available(),
 			model_path=args.model_path,
 			feature_transform=args.feature_transform
 		)
@@ -106,9 +95,8 @@ def main():
 
 	else:
 
-		print("Accion no valida. Usa 'train', 'test' o 'visualize'")
+		print("Invalid action. Use 'train', 'test' or 'visualize'")
 		return
-
 
 if __name__ == "__main__":
 
