@@ -10,6 +10,7 @@ import open3d as o3d
 import time
 import csv
 import gc
+import seaborn as sns
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, classification_report, accuracy_score
 import matplotlib.pyplot as plt
 import tracemalloc
@@ -434,6 +435,18 @@ def inference(args):
 	print(f"\nGlobal accuracy: {accuracy:.4f}%")
 
 	cm = confusion_matrix(all_targets, all_preds)
+
+	plt.figure(figsize=(10, 8))
+	sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes, linewidths=0.5, linecolor='gray', cbar=True, square=True)
+
+	plt.title('Confusion Matrix', fontsize=16)
+	plt.xlabel('Predicted Label', fontsize=12)
+	plt.ylabel('True Label', fontsize=12)
+	plt.xticks(rotation=45, ha='right')
+	plt.yticks(rotation=0)
+	plt.tight_layout()
+
+	plt.savefig(os.path.join(args.output_dir, f"{args.model}_confusion_matrix.png"))
 
 	print("\nDetailed metrics by class:")
 	print(classification_report(all_targets, all_preds, target_names=classes, digits=4, zero_division=0))
