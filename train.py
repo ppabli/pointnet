@@ -439,12 +439,15 @@ def inference(args):
 	plt.figure(figsize=(10, 8))
 	sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes, linewidths=0.5, linecolor='gray', cbar=True, square=True)
 
-	plt.title('Confusion Matrix', fontsize=16)
-	plt.xlabel('Predicted Label', fontsize=12)
-	plt.ylabel('True Label', fontsize=12)
+	plt.title('Confusion matrix', fontsize=16)
+	plt.xlabel('Predicted label', fontsize=12)
+	plt.ylabel('True label', fontsize=12)
 	plt.xticks(rotation=45, ha='right')
 	plt.yticks(rotation=0)
 	plt.tight_layout()
+
+	cbar = plt.gca().collections[0].colorbar
+	cbar.set_label('Number of samples', labelpad=15)
 
 	plt.savefig(os.path.join(args.output_dir, f"{args.model}_confusion_matrix.png"))
 
@@ -493,7 +496,9 @@ def inference(args):
 		'memory_usage': np.mean(memory_usages),
 		'memory_usage_std': np.std(memory_usages),
 		'inference_time': np.mean(inference_times),
-		'inference_time_std': np.std(inference_times)
+		'inference_time_std': np.std(inference_times),
+		'num_samples': len(all_targets),
+		'num_classes': args.num_classes,
 	}
 
 	for i, cls in enumerate(classes):
