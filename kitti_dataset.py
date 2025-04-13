@@ -517,7 +517,7 @@ def get_kitti_object_dataloaders(root_dir, batch_size=32, num_points=1024, cache
 	test_loader = DataLoader(
 		test_dataset,
 		batch_size=batch_size,
-		shuffle=False,
+		shuffle=True,
 		num_workers=4
 	)
 

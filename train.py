@@ -191,7 +191,7 @@ def train(args):
 
 				pbar.set_postfix({
 					'loss': f"{train_loss/(i+1):.4f}",
-					'acc': f"{current_acc:.4f}%"
+					'acc': f"{current_acc:.4f}"
 				})
 
 			gc.collect()
@@ -244,6 +244,8 @@ def train(args):
 		with torch.no_grad():
 
 			for points, target in val_loader:
+
+				valid_indices = target != -1
 
 				if not valid_indices.any():
 
@@ -302,8 +304,8 @@ def train(args):
 			val_metrics['recall_weighted'].append(val_recall_weighted)
 			val_metrics['f1_weighted'].append(val_f1_weighted)
 
-			print(f"Training: Loss={train_loss:.4f}, Accuracy={train_acc:.4f}%, F1={train_f1:.4f}")
-			print(f"Validation: Loss={val_loss:.4f}, Accuracy={val_acc:.4f}%, F1={val_f1:.4f}")
+			print(f"Training: Loss={train_loss:.4f}, Accuracy={train_acc:.4f}, F1={train_f1:.4f}")
+			print(f"Validation: Loss={val_loss:.4f}, Accuracy={val_acc:.4f}, F1={val_f1:.4f}")
 
 			if val_f1 > best_acc:
 
@@ -365,7 +367,7 @@ def inference(args):
 	model.eval()
 
 	print(f"Model loaded from {args.model_path}")
-	print(f"Model accuracy: {checkpoint['best_acc']:.4f}%")
+	print(f"Model accuracy: {checkpoint['best_acc']:.4f}")
 
 	_, _, test_loader = get_kitti_object_dataloaders(
 		root_dir=args.data_path,
@@ -432,7 +434,7 @@ def inference(args):
 	all_targets = np.array(all_targets)
 
 	accuracy = accuracy_score(all_targets, all_preds)
-	print(f"\nGlobal accuracy: {accuracy:.4f}%")
+	print(f"\nGlobal accuracy: {accuracy:.4f}")
 
 	cm = confusion_matrix(all_targets, all_preds)
 
@@ -495,8 +497,12 @@ def inference(args):
 		'f1_weighted': [weighted_f1],
 		'memory_usage': np.mean(memory_usages),
 		'memory_usage_std': np.std(memory_usages),
+		'memory_usage_single': np.mean(memory_usages),
+		'memory_usage_single_std': np.std(memory_usages),
 		'inference_time': np.mean(inference_times),
 		'inference_time_std': np.std(inference_times),
+		'inference_time_single': np.mean(inference_times),
+		'inference_time_single_std': np.std(inference_times),
 		'num_samples': len(all_targets),
 		'num_classes': args.num_classes,
 	}
@@ -540,15 +546,13 @@ def visualize_sample(args):
 	_, _, test_loader = get_kitti_object_dataloaders(
 		root_dir=args.data_path,
 		batch_size=1,
-		num_points=args.num_points
+		num_points=args.num_points,
 	)
 
 	classes = ['Car', 'Pedestrian', 'Cyclist']
 
 	found_valid_sample = False
 	for points, target in test_loader:
-
-		sample_start_time = time.time()
 
 		if target.item() != -1:
 
