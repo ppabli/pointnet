@@ -26,6 +26,7 @@ def save_metrics_csv(metrics_dict, filepath):
 		metrics_dict: Dictionary containing metrics data
 		filepath: Path to save the CSV file
 	"""
+
 	os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
 	with open(filepath, 'w', newline='') as csvfile:
@@ -34,18 +35,7 @@ def save_metrics_csv(metrics_dict, filepath):
 		writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
 		writer.writeheader()
-		max_len = max([len(metrics_dict[k]) if isinstance(metrics_dict[k], list) else 1 for k in fieldnames])
-
-		for key in fieldnames:
-
-			if not isinstance(metrics_dict[key], list):
-
-				metrics_dict[key] = [metrics_dict[key]] * max_len
-
-		for i in range(max_len):
-
-			row = {key: metrics_dict[key][i] if i < len(metrics_dict[key]) else None for key in fieldnames}
-			writer.writerow(row)
+		writer.writerow(metrics_dict)
 
 	print(f"Metrics saved to {filepath}")
 
@@ -347,6 +337,9 @@ def inference(args):
 
 	"""Perform inference on the KITTI dataset using a trained model"""
 
+	tracemalloc.start()
+	total_time_start = time.time()
+
 	device = torch.device("cuda" if torch.cuda.is_available() and args.use_cuda else "cpu")
 
 	if args.model == 'pointnet':
@@ -383,6 +376,8 @@ def inference(args):
 	memory_usages = []
 	inference_times = []
 
+	base_memory_usage = tracemalloc.get_traced_memory()[0]
+
 	with torch.no_grad():
 
 		for points, target in tqdm(test_loader, desc="Inference"):
@@ -400,7 +395,6 @@ def inference(args):
 			points = points.transpose(2, 1)  # [B, N, C] -> [B, C, N]
 
 			inference_start = time.time()
-			tracemalloc.start()
 
 			if args.model == 'pointnet':
 
@@ -410,20 +404,19 @@ def inference(args):
 
 				pred = model(points)
 
-			_, peak_memory = tracemalloc.get_traced_memory()
-			inference_end = time.time()
-			tracemalloc.stop()
-
-			inference_time = inference_end - inference_start
-			memory_usage = peak_memory / 10 ** 6
-
-			inference_times.append(inference_time)
-			memory_usages.append(memory_usage)
-
 			_, predicted = torch.max(pred.data, 1)
 
 			all_preds.extend(predicted.cpu().numpy())
 			all_targets.extend(target.cpu().numpy())
+
+			_, peak_memory = tracemalloc.get_traced_memory()
+			inference_end = time.time()
+
+			inference_time = inference_end - inference_start
+			memory_usage = (peak_memory - base_memory_usage) / 10 ** 6
+
+			inference_times.append(inference_time)
+			memory_usages.append(memory_usage)
 
 			gc.collect()
 			if torch.cuda.is_available():
@@ -432,6 +425,13 @@ def inference(args):
 
 	all_preds = np.array(all_preds)
 	all_targets = np.array(all_targets)
+
+	_, peak_memory = tracemalloc.get_traced_memory()
+	tracemalloc.stop()
+
+	total_memory_usage = peak_memory / 10 ** 6
+	total_time_end = time.time()
+	total_time = total_time_end - total_time_start
 
 	accuracy = accuracy_score(all_targets, all_preds)
 	print(f"\nGlobal accuracy: {accuracy:.4f}")
@@ -488,17 +488,19 @@ def inference(args):
 	print(f"F1-Score: {weighted_f1:.4f}")
 
 	test_metrics = {
-		'accuracy': [accuracy],
-		'precision_macro': [macro_precision],
-		'recall_macro': [macro_recall],
-		'f1_macro': [macro_f1],
-		'precision_weighted': [weighted_precision],
-		'recall_weighted': [weighted_recall],
-		'f1_weighted': [weighted_f1],
+		'accuracy': accuracy,
+		'precision_macro': macro_precision,
+		'recall_macro': macro_recall,
+		'f1_macro': macro_f1,
+		'precision_weighted': weighted_precision,
+		'recall_weighted': weighted_recall,
+		'f1_weighted': weighted_f1,
+		'memory_usage_total': total_memory_usage,
 		'memory_usage': np.mean(memory_usages),
 		'memory_usage_std': np.std(memory_usages),
 		'memory_usage_single': np.mean(memory_usages),
 		'memory_usage_single_std': np.std(memory_usages),
+		'inference_time_total': total_time,
 		'inference_time': np.mean(inference_times),
 		'inference_time_std': np.std(inference_times),
 		'inference_time_single': np.mean(inference_times),
@@ -509,9 +511,9 @@ def inference(args):
 
 	for i, cls in enumerate(classes):
 
-		test_metrics[f'{cls}_precision'] = [precision[i]]
-		test_metrics[f'{cls}_recall'] = [recall[i]]
-		test_metrics[f'{cls}_f1'] = [f1[i]]
+		test_metrics[f'{cls}_precision'] = precision[i]
+		test_metrics[f'{cls}_recall'] = recall[i]
+		test_metrics[f'{cls}_f1'] = f1[i]
 
 	test_csv_path = os.path.join(args.output_dir, f"{args.model}_test_metrics.csv")
 	save_metrics_csv(test_metrics, test_csv_path)
