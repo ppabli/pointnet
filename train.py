@@ -337,9 +337,6 @@ def inference(args):
 
 	"""Perform inference on the KITTI dataset using a trained model"""
 
-	tracemalloc.start()
-	total_time_start = time.time()
-
 	device = torch.device("cuda" if torch.cuda.is_available() and args.use_cuda else "cpu")
 
 	if args.model == 'pointnet':
@@ -376,11 +373,11 @@ def inference(args):
 	memory_usages = []
 	inference_times = []
 
-	base_memory_usage = tracemalloc.get_traced_memory()[0]
-
 	with torch.no_grad():
 
 		for points, target in tqdm(test_loader, desc="Inference"):
+
+			tracemalloc.start()
 
 			valid_indices = target != -1
 
@@ -404,16 +401,21 @@ def inference(args):
 
 				pred = model(points)
 
-			_, predicted = torch.max(pred.data, 1)
-
-			all_preds.extend(predicted.cpu().numpy())
-			all_targets.extend(target.cpu().numpy())
-
-			_, peak_memory = tracemalloc.get_traced_memory()
 			inference_end = time.time()
 
+			_, predicted = torch.max(pred.data, 1)
+
+			preds = predicted.cpu().numpy()
+			targets = target.cpu().numpy()
+
+			_, peak_memory = tracemalloc.get_traced_memory()
+			tracemalloc.stop()
+
+			all_preds.extend(preds)
+			all_targets.extend(targets)
+
 			inference_time = inference_end - inference_start
-			memory_usage = (peak_memory - base_memory_usage) / 10 ** 6
+			memory_usage = peak_memory/ 10 ** 6
 
 			inference_times.append(inference_time)
 			memory_usages.append(memory_usage)
@@ -425,13 +427,6 @@ def inference(args):
 
 	all_preds = np.array(all_preds)
 	all_targets = np.array(all_targets)
-
-	_, peak_memory = tracemalloc.get_traced_memory()
-	tracemalloc.stop()
-
-	total_memory_usage = peak_memory / 10 ** 6
-	total_time_end = time.time()
-	total_time = total_time_end - total_time_start
 
 	accuracy = accuracy_score(all_targets, all_preds)
 	print(f"\nGlobal accuracy: {accuracy:.4f}")
@@ -495,12 +490,10 @@ def inference(args):
 		'precision_weighted': weighted_precision,
 		'recall_weighted': weighted_recall,
 		'f1_weighted': weighted_f1,
-		'memory_usage_total': total_memory_usage,
 		'memory_usage': np.mean(memory_usages),
 		'memory_usage_std': np.std(memory_usages),
 		'memory_usage_single': np.mean(memory_usages),
 		'memory_usage_single_std': np.std(memory_usages),
-		'inference_time_total': total_time,
 		'inference_time': np.mean(inference_times),
 		'inference_time_std': np.std(inference_times),
 		'inference_time_single': np.mean(inference_times),
