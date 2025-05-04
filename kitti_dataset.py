@@ -294,7 +294,7 @@ class KittiObjectDataset(Dataset):
 
 		return points[mask]
 
-	def _extract_objects_from_scene(self, idx, lidar_paths, label_paths, calib_paths, min_points=50):
+	def _extract_objects_from_scene(self, idx, lidar_paths, label_paths, calib_paths, min_points=32):
 		"""Extract individual objects from a KITTI scene"""
 
 		lidar_file = lidar_paths[idx]

@@ -68,9 +68,10 @@ def train(args):
 	optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 	scheduler = StepLR(optimizer, step_size=20, gamma=0.5)
 
-	class_counts = [0] * args.num_classes
+	class_counts_train = [0] * args.num_classes
+	class_counts_val = [0] * args.num_classes
 
-	print("Calculating weights for loss function...")
+	print("Calculating weights for loss functions...")
 
 	for _, target in train_loader:
 
@@ -82,17 +83,37 @@ def train(args):
 
 			for t in target_valid:
 
-				class_counts[t.item()] += 1
+				class_counts_train[t.item()] += 1
 
-	print(f"Class counts: {class_counts}")
+	for _, target in val_loader:
 
-	weights = torch.FloatTensor([1.0 / max(count, 1) for count in class_counts])
-	weights = weights / weights.sum() * args.num_classes
-	weights = weights.to(device)
+		valid_indices = target != -1
 
-	print(f"Weights for loss function: {weights}")
+		if valid_indices.any():
 
-	criterion = nn.CrossEntropyLoss(weight=weights)
+			target_valid = target[valid_indices]
+
+			for t in target_valid:
+
+				class_counts_val[t.item()] += 1
+
+	print(f"Class counts (Train): {class_counts_train}")
+	print(f"Class counts (Val): {class_counts_val}")
+
+	weights_train = torch.FloatTensor([1.0 / max(count, 1) for count in class_counts_train])
+	weights_train = weights_train / weights_train.sum() * args.num_classes
+	weights_train = weights_train.to(device)
+
+	print(f"Weights for loss function (Train): {weights_train}")
+
+	weights_val = torch.FloatTensor([1.0 / max(count, 1) for count in class_counts_val])
+	weights_val = weights_val / weights_val.sum() * args.num_classes
+	weights_val = weights_val.to(device)
+
+	print(f"Weights for loss function (Val): {weights_val}")
+
+	criterion_train = nn.CrossEntropyLoss(weight=weights_train)
+	criterion_val = nn.CrossEntropyLoss(weight=weights_val)
 
 	best_acc = 0.0
 	train_loss_history = []
@@ -160,7 +181,7 @@ def train(args):
 				pred = model(points)
 				trans_feat = None
 
-			loss = criterion(pred, target)
+			loss = criterion_train(pred, target)
 
 			if args.feature_transform and args.model == 'pointnet':
 
@@ -255,7 +276,7 @@ def train(args):
 
 					pred = model(points)
 
-				loss = criterion(pred, target)
+				loss = criterion_val(pred, target)
 				val_loss += loss.item()
 
 				_, predicted = torch.max(pred.data, 1)
